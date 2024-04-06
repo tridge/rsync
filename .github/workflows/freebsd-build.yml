@@ -1,0 +1,39 @@
+name: Test rsync on FreeBSD
+
+on: [push]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    name: Test rsync on FreeBSD
+    steps:
+    - uses: actions/checkout@v4
+    - name: Test in FreeBSD
+      id: test
+      uses: vmactions/freebsd-vm@v1
+      with:
+        usesh: true
+        prepare: |
+          pkg install -y bash autotools m4 xxhash zstd liblz4 wget
+        run: |
+          freebsd-version
+          ./configure --with-rrsync
+          make
+          sudo make install
+          rsync --version
+          sudo RSYNC_EXPECT_SKIPPED=crtimes make check
+          sudo RSYNC_EXPECT_SKIPPED=crtimes make check30
+          sudo RSYNC_EXPECT_SKIPPED=crtimes make check29
+          rsync-ssl --no-motd download.samba.org::rsyncftp/ || true
+    - name: save artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: freebsd-bin
+        path: |
+          rsync
+          rsync-ssl
+          rsync.1
+          rsync-ssl.1
+          rsyncd.conf.5
+          rrsync.1
+          rrsync
