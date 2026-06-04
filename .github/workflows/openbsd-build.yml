@@ -1,18 +1,12 @@
 name: Test rsync on OpenBSD
 
+# FLAKE-HUNT BRANCH: the only workflow kept on this branch.  PUSH the branch
+# (do NOT open a PR -- pull_request events run the base branch's workflows, i.e.
+# master's full matrix).  workflow_dispatch lets you re-run to gather samples.
 on:
   push:
-    branches: [ master ]
-    paths-ignore:
-      - '.github/workflows/*.yml'
-      - '!.github/workflows/openbsd-build.yml'
-  pull_request:
-    branches: [ master ]
-    paths-ignore:
-      - '.github/workflows/*.yml'
-      - '!.github/workflows/openbsd-build.yml'
-  schedule:
-    - cron: '42 8 * * *'
+    branches: [ openbsd-flake ]
+  workflow_dispatch:
 
 jobs:
   test:
@@ -34,20 +28,26 @@ jobs:
           export AUTOCONF_VERSION=2.71
           export AUTOMAKE_VERSION=1.16
           ./configure --with-rrsync --disable-zstd --disable-md2man --disable-xxhash --disable-lz4
-          make
+          # check-progs builds rsync AND the test helper programs + symlinks that
+          # runtests.py needs (plain `make` builds only rsync; the helpers are
+          # normally built as a dependency of the `check` target we bypass here).
+          make check-progs
           ./rsync --version
-          # Both runs are throttled to -j2 on this job (vs -j8 elsewhere): it
-          # runs inside a nested VM, and the default parallelism over-subscribes
-          # it.  Under that resource pressure a daemon test occasionally stalls
-          # to the 300s timeout -- the --use-tcp run loses a loopback
-          # connection-handshake timing race, and the pipe `make check` run
-          # likewise stalls a forked-daemon test (daemon-config has been seen).
-          # It is an environment artifact, not an rsync bug (deadlock-free and
-          # unreproducible elsewhere, even at -j16 on a 6-CPU host); -j2 keeps
-          # the nested VM from over-subscribing.
-          make check CHECK_J=2
-          ./runtests.py --rsync-bin=`pwd`/rsync --use-tcp -j 2
-          ./rsync-ssl --no-motd download.samba.org::rsyncftp/ || true
+          # FLAKE HUNT: loop the pipe suite at the *un-throttled* -j8 (the
+          # parallelism that exhibited the intermittent daemon-test hang) to try
+          # to reproduce it, with a shorter per-test timeout so a hang surfaces
+          # fast.  runtests now dumps the hung process tree (ps WCHAN + fstat) on
+          # timeout, so a reproduction is diagnosable straight from this log.
+          # Stops at the first hang; "no hang" after all iterations is a clean
+          # (non-)result.  Bump the count / -j if it doesn't reproduce.
+          for i in $(seq 1 20); do
+            echo "=================== flake-hunt iteration $i ==================="
+            ./runtests.py --rsync-bin=`pwd`/rsync -j 8 --timeout 120 || {
+              echo "########## REPRODUCED a hang/failure on iteration $i ##########"
+              exit 1
+            }
+          done
+          echo "no hang reproduced in 20 iterations at -j8"
     - name: save artifact
       uses: actions/upload-artifact@v4
       with:
