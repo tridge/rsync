@@ -27,6 +27,8 @@ import concurrent.futures
 import fnmatch
 import glob
 import os
+import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -292,6 +294,75 @@ class TestResult:
         self.skipped_reason = skipped_reason
 
 
+def _diag_run(cmd):
+    """Run a diagnostic command with a short timeout; never raise."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=20).stdout.rstrip()
+    except Exception as e:  # noqa: BLE001 - diagnostics must never break a run
+        return f'({" ".join(cmd)} failed: {e})'
+
+
+def capture_hang_diagnostics(pgid, logfile):
+    """Append a snapshot of the still-live process tree to a test's log when it
+    times out, so a hang is diagnosable after the fact.
+
+    The key signal is WCHAN (the kernel sleep channel): e.g. 'piperd'/'pipew'
+    means a process is blocked reading/writing a pipe, 'wait' means it is
+    waiting on a child, 'netio'/'kqread' a socket/poll.  fstat then shows which
+    pipe/socket fds the stuck processes hold.  Best-effort and platform-tolerant
+    (BSD/macOS fstat, else lsof, else just ps); never raises.
+    """
+    out = ['', f'===== HANG DIAGNOSTICS (test process group {pgid}) =====',
+           '--- full process table (WCHAN = kernel sleep channel) ---']
+    ps_full = _diag_run(['ps', '-axww', '-o', 'pid,ppid,pgid,stat,wchan,command'])
+    if ps_full.startswith('('):
+        ps_full = _diag_run(['ps', 'axl'])
+    out.append(ps_full)
+
+    # Pick out the pids in this test's own process group (start_new_session put
+    # the test script and the rsync client/daemon it forked into pgid==its pid).
+    pids = []
+    for line in ps_full.splitlines()[1:]:
+        f = line.split(None, 5)
+        if len(f) >= 3 and f[2] == str(pgid):
+            pids.append(f[0])
+    out.append(f'--- this test\'s process group: pids {pids or "[none captured]"} ---')
+
+    fd_tool = 'fstat' if shutil.which('fstat') else ('lsof' if shutil.which('lsof') else None)
+    for pid in pids:
+        if fd_tool == 'fstat':
+            out.append(f'--- fstat -p {pid} (open fds; pipes/sockets the hang holds) ---')
+            out.append(_diag_run(['fstat', '-p', pid]))
+        elif fd_tool == 'lsof':
+            out.append(f'--- lsof -n -p {pid} ---')
+            out.append(_diag_run(['lsof', '-n', '-p', pid]))
+        elif os.path.isdir(f'/proc/{pid}/fd'):
+            out.append(f'--- /proc/{pid}/fd + wchan ---')
+            out.append(_diag_run(['ls', '-l', f'/proc/{pid}/fd']))
+    out.append('===== END HANG DIAGNOSTICS =====')
+    try:
+        with open(logfile, 'a') as log:
+            log.write('\n'.join(out) + '\n')
+    except OSError:
+        pass
+
+
+def _kill_process_group(proc):
+    """SIGTERM then SIGKILL the test's whole process group (test + the rsync
+    client/daemon it forked), so a hung daemon doesn't linger."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        try:
+            proc.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
 def run_one_test(testscript, testbase, scratchdir, base_env, timeout,
                  srcdir, tooldir, setfacl_nodef, always_log):
     """Run a single test. Returns a TestResult.
@@ -312,16 +383,24 @@ def run_one_test(testscript, testbase, scratchdir, base_env, timeout,
         cmd = ['sh', '-e', testscript]
 
     logfile = os.path.join(scratchdir, 'test.log')
+    # Run the test in its own session/process group so that on a timeout we can
+    # snapshot the still-live process tree (capture_hang_diagnostics) BEFORE
+    # killing the whole group -- otherwise subprocess.run(timeout=) would SIGKILL
+    # the child first and a hang would leave no trace.
+    log = open(logfile, 'w')
     try:
-        with open(logfile, 'w') as log:
-            proc = subprocess.run(
-                cmd,
-                stdout=log, stderr=subprocess.STDOUT,
-                env=env, timeout=timeout,
-                cwd=env.get('TOOLDIR', '.')
-            )
-        result = proc.returncode
+        proc = subprocess.Popen(
+            cmd, stdout=log, stderr=subprocess.STDOUT,
+            env=env, cwd=env.get('TOOLDIR', '.'),
+            start_new_session=True,
+        )
+    finally:
+        log.close()
+    try:
+        result = proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
+        capture_hang_diagnostics(proc.pid, logfile)
+        _kill_process_group(proc)
         result = 1
         with open(logfile, 'a') as log:
             log.write(f"\nTIMEOUT: test took over {timeout} seconds\n")
